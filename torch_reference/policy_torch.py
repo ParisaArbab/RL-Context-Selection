@@ -1,72 +1,64 @@
 """
-policy_torch.py
+policy_torch.py  (superseded -- kept for history, see below)
 ================
 
-A PyTorch reimplementation of `context_selection.policy.MLPBernoulliPolicy`,
-same architecture and interface, for use once GPU/PyTorch infra is
-available (this sandbox had neither -- see the top-level README for why
-the NumPy version is the one all experiments in this repo actually run
-on). Included so the from-scratch derivation in `policy.py` can be
-cross-checked against `torch.autograd`, and as a starting point for
-scaling this up (batched rollouts, GPU, larger networks) on real infra.
+STATUS UPDATE: this file was originally written as an untested stub, back
+when this sandbox had no internet access and no PyTorch installed -- it
+was never run. Internet access is now available, `torch` is installed,
+and this module has been superseded by the actively-used, actually-run,
+and gradient-cross-checked implementation at
+`src/context_selection/policy_torch.py` (used by `train_torch.py` and
+`ppo_torch.py`, validated by `tests/test_policy_torch.py`, and exercised
+end-to-end by `experiments/run_benchmark_torch.py`). See the top-level
+README and `report.md` Sec. 8 for what actually ran and what it found.
 
-NOT executed as part of this repo's test suite / experiments (no torch
-in the sandbox); install `torch` and run the `__main__` block below to
-sanity check it produces gradients consistent with the NumPy version on
-a fixed state/action/seed.
+This file is kept, unmodified in spirit, as a record of the original
+plan and to show the delta between "a stub that should work" and "code
+that was actually run and validated." The `__main__` block below now
+does a real cross-check (loading identical weights and comparing to the
+NumPy gradient exactly) instead of only printing a gradient tensor with
+nothing to compare it against, since torch is now available to actually
+run it.
 """
+import os
+import sys
+
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-class MLPBernoulliPolicyTorch(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int = 32):
-        super().__init__()
-        self.fc1 = nn.Linear(obs_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
-        h = torch.tanh(self.fc1(s))
-        logit = self.fc2(h).squeeze(-1)
-        return logit  # return logits; use torch.distributions.Bernoulli(logits=logit)
-
-    def act(self, s: torch.Tensor):
-        logit = self.forward(s)
-        dist = torch.distributions.Bernoulli(logits=logit)
-        action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy()
-
-
-def reinforce_update(policy: MLPBernoulliPolicyTorch, optimizer: torch.optim.Optimizer,
-                      log_probs: list[torch.Tensor], advantages: torch.Tensor,
-                      entropies: list[torch.Tensor], entropy_coef: float = 0.01):
-    """Standard PyTorch REINFORCE update -- the natural analogue of the
-    manual `logprob_grad` + Adam loop in `context_selection/train.py`,
-    provided for parity/scale-up once torch is available."""
-    log_probs_t = torch.stack(log_probs)
-    entropies_t = torch.stack(entropies)
-    loss = -(log_probs_t * advantages).sum() - entropy_coef * entropies_t.sum()
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
-    optimizer.step()
-    return loss.item()
+from context_selection.policy import MLPBernoulliPolicy  # noqa: E402
+from context_selection.policy_torch import (  # noqa: E402
+    MLPBernoulliPolicyTorch,
+    load_numpy_weights,
+    to_float64,
+)
 
 
 if __name__ == "__main__":
-    # Minimal cross-check against the NumPy implementation's math: same
-    # architecture, same random weights, same state/action -> same
-    # d(logpi)/d(logit) sign and rough magnitude.
-    torch.manual_seed(0)
-    policy = MLPBernoulliPolicyTorch(obs_dim=6, hidden_dim=5)
-    s = torch.randn(6)
-    logit = policy(s)
+    # Real cross-check (not just a printed tensor): identical weights,
+    # identical state/action, NumPy hand-derived grad vs. torch.autograd
+    # grad, compared directly.
+    np_policy = MLPBernoulliPolicy(obs_dim=6, hidden_dim=5, seed=0)
+    torch_policy = to_float64(MLPBernoulliPolicyTorch(obs_dim=6, hidden_dim=5, seed=0))
+    load_numpy_weights(torch_policy, np_policy.params)
+
+    rng = np.random.default_rng(0)
+    s = rng.normal(size=6)
+    action = 1
+
+    _, cache = np_policy.forward(s)
+    np_grad = np_policy.logprob_grad(cache, action, coeff=1.0)
+
+    s_t = torch.as_tensor(s, dtype=torch.float64)
+    logit = torch_policy(s_t)
     dist = torch.distributions.Bernoulli(logits=logit)
-    action = torch.tensor(1.0)
-    logp = dist.log_prob(action)
+    logp = dist.log_prob(torch.as_tensor(float(action), dtype=torch.float64))
     logp.backward()
-    print("torch grad on fc2.weight:", policy.fc2.weight.grad)
-    print("(compare against context_selection.policy.logprob_grad on an")
-    print(" equivalent NumPy-initialized network -- see tests/test_policy.py")
-    print(" for the from-scratch version's own finite-difference check.)")
+
+    print("NumPy   dW2:", np_grad["W2"])
+    print("Torch   dW2:", torch_policy.fc2.weight.grad.numpy().reshape(-1))
+    print("max abs diff (W2):", np.max(np.abs(np_grad["W2"] - torch_policy.fc2.weight.grad.numpy().reshape(-1))))
+    print("(see tests/test_policy_torch.py for the full assertion-based")
+    print(" version of this check, across more states/actions/params.)")

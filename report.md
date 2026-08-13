@@ -65,16 +65,37 @@ All three RL variants use the identical policy architecture, optimizer, and
 evaluation protocol, so differences are attributable to the *training
 method*, not incidental implementation differences.
 
-**On the from-scratch implementation:** the policy network, its REINFORCE
-gradient, and its PPO clipped-surrogate gradient are all hand-derived and
-implemented in NumPy (no `torch.autograd`), because this sandbox has no
-PyTorch installed and I wanted every result here to come from code that
-actually ran, not code that "should work." `tests/test_policy.py` checks
-the hand-derived REINFORCE gradient against numerical finite differences
-across every parameter, for both actions -- this is the test I'd want to
-see before trusting any of the training curves below. An idiomatic PyTorch
-version of the same policy is included in `torch_reference/` for
-production/GPU use.
+**On the implementation(s):** this project now has two independent, fully
+executed implementations of the same policy, environment, and training
+algorithms:
+
+1. **From-scratch NumPy** (`src/context_selection/policy.py`, `train.py`,
+   `ppo.py`) -- forward pass, manual backprop for both the REINFORCE
+   score-function estimator and the PPO clipped-surrogate objective, and a
+   hand-written Adam optimizer. Built with no `torch.autograd`, originally
+   because the sandbox this was first built in had no PyTorch installed,
+   and kept because writing the gradients by hand is a useful correctness
+   exercise in its own right. `tests/test_policy.py` checks the
+   hand-derived REINFORCE gradient against numerical finite differences
+   across every parameter, for both actions.
+2. **PyTorch** (`src/context_selection/policy_torch.py`, `train_torch.py`,
+   `ppo_torch.py`) -- the same architecture and algorithms, but gradients
+   come from `torch.autograd` and optimization from `torch.optim.Adam`,
+   rather than hand-derived math. This was ported once internet access was
+   available to `pip install torch`, and is validated in two ways rather
+   than assumed to be correct: (a) `tests/test_policy_torch.py` loads
+   identical weights into both implementations and checks that
+   `torch.autograd`'s gradient of `log pi(a|s)` matches the hand-derived
+   NumPy gradient to float64 precision (not just similar -- this
+   cross-checks the two implementations against *each other*, on top of
+   the finite-difference check that already validates the NumPy side
+   alone); (b) the full benchmark below was rerun end-to-end with the
+   PyTorch trainers across the same 3 seeds, not assumed to reproduce the
+   NumPy numbers.
+
+Section 8b below reports the PyTorch benchmark results and an honest
+comparison against the NumPy run, including a difference in training
+stability I did not expect and could not fully explain away.
 
 ## 4. Reward shaping: the theory, and what I actually found
 
@@ -181,16 +202,133 @@ sufficient*, which is where the real cost savings live.
 4. **Scale up**: bigger candidate lists, richer (non-linear) relevance
    structure, and a real embedding model in place of synthetic vectors --
    the current environment is deliberately small so every result here could
-   be run and checked in this sandbox in under two minutes; the natural
-   next step is running the same code against real retrieval traces on
-   GPU infra, via the PyTorch policy in `torch_reference/`.
+   be run and checked in well under two minutes per implementation; the
+   natural next step is running the same code against real retrieval
+   traces on GPU infra, via the PyTorch trainers in `train_torch.py` /
+   `ppo_torch.py` (batched rollouts and a GPU device would be the first
+   two changes -- the current port is still one-episode-at-a-time, CPU
+   only, matching the NumPy version's structure for a clean comparison).
+5. **Track down the shaping-variance gap** (Sec. 8.2) with a controlled
+   ablation: swap the exact torch entropy gradient for the NumPy
+   surrogate (and vice versa) with everything else held fixed, to test
+   the "approximate entropy gradient accidentally regularizes" hypothesis
+   directly instead of leaving it as a plausible-but-unconfirmed
+   explanation.
 
-## 8. Reproducing everything in this report
+## 8. PyTorch port: validation and results
+
+### 8.1 Gradient cross-check
+
+Before trusting any PyTorch training curve, `tests/test_policy_torch.py`
+loads the *exact same weights* into `MLPBernoulliPolicy` (NumPy) and
+`MLPBernoulliPolicyTorch` (PyTorch), runs the same state/action through
+both, and compares `logprob_grad`'s hand-derived gradient to
+`torch.autograd`'s gradient directly (float64, `atol=1e-8`) across 10
+random states x 2 actions x 4 parameter tensors. All match. This is a
+stronger check than "both networks learn something reasonable" -- it
+confirms the two implementations compute the identical mathematical
+function and its identical gradient, not just similar ones.
+
+### 8.2 Benchmark results: NumPy vs. PyTorch
+
+Same environment, same 3 seeds (0/1/2), same 300-episode held-out
+evaluation, same hyperparameters. The only thing that changed is which
+implementation trained the policy.
+
+| Method | NumPy reward | PyTorch reward | NumPy success | PyTorch success | NumPy cost | PyTorch cost |
+|---|---:|---:|---:|---:|---:|---:|
+| REINFORCE, no shaping | 0.626 ± 0.001 | 0.624 ± 0.002 | 0.972 | 0.974 | 0.931 | 0.943 |
+| REINFORCE, + shaping | 0.482 ± 0.081 | 0.441 ± **0.176** | 0.764 | 0.697 | 0.764 | 0.688 |
+| PPO-lite, + shaping | 0.607 ± 0.005 | 0.553 ± **0.098** | 0.942 | 0.862 | 0.899 | 0.833 |
+| Random (p=0.5) | 0.635 | 0.635 | 0.971 | 0.971 | 0.907 | 0.907 |
+| Greedy-relevance | 0.645 | 0.645 | 1.000 | 1.000 | 0.927 | 0.927 |
+| Oracle | 0.875 | 0.875 | 1.000 | 1.000 | 0.356 | 0.356 |
+
+(baselines and the oracle are identical by construction -- they don't
+depend on the policy implementation at all, only on the shared
+`environment.py`/`baselines.py`, which was not touched by the port.)
+
+**What replicates cleanly:** REINFORCE without shaping lands within 0.3%
+of the NumPy result, with comparably tight variance across seeds. The
+qualitative headline findings of this report all replicate: shaping
+still measurably *hurts* REINFORCE rather than helping it, and PPO-lite
+still reaches REINFORCE-no-shaping's performance level in roughly an
+order of magnitude fewer training episodes (visible in
+`experiments/results/learning_curves_torch.png` -- the green PPO curve
+plateaus by ~500-1000 episodes, red REINFORCE only catches up by
+~2500-3000).
+
+**What does not replicate cleanly, stated plainly rather than smoothed
+over:** both methods that use reward shaping (REINFORCE + shaping,
+PPO-lite + shaping) show meaningfully *higher variance across seeds* in
+the PyTorch version than the NumPy version -- REINFORCE+shaping's
+seed-to-seed std more than doubles (0.081 -> 0.176), and PPO-lite's
+final reward is visibly lower and less stable (0.607 -> 0.553, std
+0.005 -> 0.098). Looking at individual seeds' PPO-lite learning curves,
+one seed dips sharply late in training (down to ~0.35 mid-run before
+partially recovering) where the NumPy runs stayed smooth across all 3
+seeds. This is real, reproducible instability, not a one-off fluke of a
+single run -- and I want to flag it rather than quietly report only the
+mean.
+
+**My best explanation, again stated as a hypothesis, not a conclusion:**
+the NumPy trainer's entropy bonus uses a hand-written *approximate*
+gradient, `dH/dlogit ~ (0.5 - p) * 4` (see the comment in `train.py`),
+chosen because it was simpler to derive by hand than the exact Bernoulli
+entropy gradient. The PyTorch version uses
+`torch.distributions.Bernoulli(logits=...).entropy()`, differentiated
+*exactly* by autograd. These are not the same function: the true entropy
+gradient `dH/dlogit = -p(1-p) * logit` shrinks toward zero as the policy
+becomes confident (`p` near 0 or 1), while the NumPy surrogate stays
+close to its bounded max (~2) even at extreme confidence. In effect, the
+NumPy version's "wrong" entropy gradient acts as a stronger, confidence-
+independent regularizer that keeps pulling the policy back from
+saturated (very confident) predictions, which may be *accidentally*
+stabilizing training -- while the PyTorch version's exact entropy
+gradient lets a confident, shaped-reward-chasing policy get more
+confident with less pushback, right up until a step overcorrects. I
+consider this a genuinely interesting result: an intentional
+approximation in the hand-derived version may have been doing useful
+regularization work that "doing it correctly" in PyTorch removes. I have
+not run the controlled experiment needed to confirm this (e.g. swapping
+in the exact NumPy entropy gradient, or the approximate surrogate in
+PyTorch, and comparing variance with everything else held fixed) -- that
+is the natural next step and is now easy to run given both
+implementations exist side by side.
+
+A second, more mundane contributor: `train_torch.py`/`ppo_torch.py` and
+the NumPy trainers draw from independent RNG streams (torch's generator
+vs. NumPy's), so `seed=1` does not correspond to the same actual episode
+sequence in both -- some of the extra spread could simply be different
+(unlucky) draws rather than an algorithmic difference. I can't fully
+separate these two effects without more seeds than the 3 this report
+uses, so I'm reporting both as plausible contributors rather than picking
+one.
+
+### 8.3 What this changes about the project's framing
+
+The original "Why NumPy?" framing (no internet access, no PyTorch
+available) is no longer accurate now that internet access is available.
+The from-scratch NumPy implementation is kept -- it's still fully tested,
+still the one with the tightest seed-to-seed variance in this benchmark,
+and the hand-derived gradients remain a useful correctness exercise -- but
+it is no longer the "PyTorch wasn't available so I did it by hand" story.
+It is now: two validated implementations of the same research idea, and a
+concrete, reproducible finding that porting to idiomatic autograd is not
+a pure improvement in this setup -- it removed an intentional
+approximation that happened to add stability, which is exactly the kind
+of thing you only find by actually running both, not by assuming the
+"proper" framework version is strictly better.
+
+## 9. Reproducing everything in this report
 
 ```bash
-pip install -r requirements.txt
-python -m unittest discover -s tests -v      # 14 tests, ~0.1s
-python experiments/run_benchmark.py           # ~90s total
+pip install -r requirements.txt          # numpy + matplotlib (+ torch, optional)
+python -m unittest discover -s tests -v      # 17 tests, ~0.1s (torch tests skip if torch isn't installed)
+python experiments/run_benchmark.py           # NumPy trainers, ~90s total
+python experiments/run_benchmark_torch.py     # PyTorch trainers, ~3 min total (requires torch)
 ```
-`experiments/results/` will contain `results.csv` (the exact numbers
-quoted above), `learning_curves.png`, and `benchmark_comparison.png`.
+`experiments/results/` will contain `results.csv` / `results_torch.csv`
+(the exact numbers quoted above), `learning_curves.png` /
+`learning_curves_torch.png`, and `benchmark_comparison.png` /
+`benchmark_comparison_torch.png`.
