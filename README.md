@@ -90,3 +90,5 @@ of the likely cause and a concretely testable fix, rather than tuning it
 away.
 
 ![benchmark](experiments/results/benchmark_comparison.png)
+
+*(Repo initialized and maintained by Parisa Arbab.)*
