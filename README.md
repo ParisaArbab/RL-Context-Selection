@@ -1,7 +1,6 @@
 # RL for Context Selection in Agent Workflows
 
-A small, self-contained research project built for the **Pokee RL AI Research
-Intern** application, targeting the role's first bullet directly:
+A small, self-contained research project built for the **RL AI Research** application, targeting the role's first bullet directly:
 
 > *"Investigate and prototype novel RL approaches for context selection,
 > reward shaping, or policy optimization in agent workflows."*
