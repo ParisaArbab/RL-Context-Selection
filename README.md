@@ -92,3 +92,5 @@ away.
 ![benchmark](experiments/results/benchmark_comparison.png)
 
 *(Repo initialized and maintained by Parisa Arbab.)*
+
+For questions about this project, feel free to open an issue.
