@@ -13,8 +13,9 @@ This package implements:
   * `environment.py`   -- a synthetic but non-trivial MDP for context
                            selection, with configurable relevance,
                            redundancy, distractor, and cost structure.
-  * `policy.py`         -- a from-scratch (NumPy) MLP policy trained
-                           with REINFORCE + baseline + entropy bonus.
+  * `policy.py`         -- a small MLP Bernoulli policy (PyTorch),
+                           trained with REINFORCE + baseline + entropy
+                           bonus via torch.autograd.
   * `reward.py`         -- reward functions, including a potential-based
                            reward-shaping term (Ng, Harada & Russell,
                            1999) that provably preserves the optimal

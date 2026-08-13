@@ -2,31 +2,28 @@
 train.py
 ========
 
-REINFORCE (Williams, 1992) with:
+REINFORCE (Williams, 1992) for the context-selection policy, implemented
+with `torch.autograd` and `torch.optim.Adam`, with:
   * a moving-average value baseline (variance reduction, does not bias
     the gradient since d/dtheta E[b * log pi] = b * d/dtheta E[log pi] = 0
     for any baseline b that doesn't depend on the action),
-  * an entropy bonus (encourages exploration / avoids premature
-    collapse to always-skip, which is a tempting local optimum since
-    skipping never over-spends the budget),
+  * an entropy bonus (`torch.distributions.Bernoulli.entropy()`,
+    differentiated exactly by autograd) to encourage exploration and
+    avoid premature collapse to always-skip, which is a tempting local
+    optimum since skipping never over-spends the budget,
   * optional potential-based reward shaping (see reward.py),
-  * gradient clipping (episodes have variable length, and the summed
-    policy gradient can occasionally spike).
-
-This is intentionally a *policy-gradient fundamentals* implementation --
-no replay buffer, no target network, no autograd -- to keep every design
-choice inspectable, matching the "solid understanding of RL fundamentals"
-and "prototype novel RL approaches for ... reward shaping ... in agent
-workflows" asks in the role description.
+  * gradient-norm clipping (episodes have variable length, and the
+    summed policy gradient can occasionally spike).
 """
 
 from __future__ import annotations
 import numpy as np
+import torch
 from dataclasses import dataclass, field
 from typing import List
 
 from .environment import ContextSelectionEnv
-from .policy import MLPBernoulliPolicy, AdamOptimizer, zero_grads, add_grads
+from .policy import MLPBernoulliPolicy, to_float64
 from .reward import shaped_rewards, discounted_returns
 
 
@@ -54,16 +51,17 @@ class TrainLog:
     eval_cost_frac: List[float] = field(default_factory=list)
 
 
-def run_episode_collect(env: ContextSelectionEnv, policy: MLPBernoulliPolicy, rng: np.random.Generator,
+def run_episode_collect(env: ContextSelectionEnv, policy: MLPBernoulliPolicy,
                          gamma: float, use_shaping: bool):
     obs = env.reset()
-    caches, actions, raw_rewards, potentials = [], [], [], [env.potential(env._selected_idx)]
+    states, actions, raw_rewards, potentials = [], [], [], [env.potential(env._selected_idx)]
 
     done = False
     while not done:
-        action, prob, cache = policy.act(obs, rng, greedy=False)
+        s_t = torch.as_tensor(obs, dtype=torch.float64)
+        action, _ = policy.act(s_t, greedy=False)
         step = env.step(action)
-        caches.append(cache)
+        states.append(obs)
         actions.append(action)
         raw_rewards.append(step.reward)
         potentials.append(env.potential(env._selected_idx))
@@ -75,82 +73,69 @@ def run_episode_collect(env: ContextSelectionEnv, policy: MLPBernoulliPolicy, rn
         r = np.asarray(raw_rewards, dtype=np.float64)
 
     returns = discounted_returns(r, gamma=gamma)
-    return caches, actions, returns, sum(raw_rewards), info
+    return states, actions, returns, sum(raw_rewards), info
 
 
-def evaluate(env: ContextSelectionEnv, policy: MLPBernoulliPolicy, n_episodes: int, rng: np.random.Generator):
+def evaluate(env: ContextSelectionEnv, policy: MLPBernoulliPolicy,
+             n_episodes: int) -> tuple[float, float, float]:
     total = 0.0
     successes, cost_fracs = [], []
-    for _ in range(n_episodes):
-        obs = env.reset()
-        done = False
-        ep_reward = 0.0
-        info = {}
-        while not done:
-            action, _, _ = policy.act(obs, rng, greedy=True)
-            step = env.step(action)
-            obs, done, info = step.observation, step.done, step.info
-            ep_reward += step.reward
-        total += ep_reward
-        successes.append(info.get("success", 0.0))
-        cost_fracs.append(info.get("cost_frac", 0.0))
+    with torch.no_grad():
+        for _ in range(n_episodes):
+            obs = env.reset()
+            done = False
+            ep_reward = 0.0
+            info = {}
+            while not done:
+                s_t = torch.as_tensor(obs, dtype=torch.float64)
+                action, _ = policy.act(s_t, greedy=True)
+                step = env.step(action)
+                obs, done, info = step.observation, step.done, step.info
+                ep_reward += step.reward
+            total += ep_reward
+            successes.append(info.get("success", 0.0))
+            cost_fracs.append(info.get("cost_frac", 0.0))
     return total / n_episodes, float(np.mean(successes)), float(np.mean(cost_fracs))
 
 
 def train_reinforce(env: ContextSelectionEnv, cfg: TrainConfig) -> tuple[MLPBernoulliPolicy, TrainLog]:
-    rng = np.random.default_rng(cfg.seed)
-    policy = MLPBernoulliPolicy(obs_dim=env.obs_dim, hidden_dim=32, seed=cfg.seed)
-    opt = AdamOptimizer(policy.params, lr=cfg.lr)
+    torch.manual_seed(cfg.seed)
+    policy = to_float64(MLPBernoulliPolicy(obs_dim=env.obs_dim, hidden_dim=32, seed=cfg.seed))
+    opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
     log = TrainLog()
 
     baseline = 0.0
     for ep in range(1, cfg.num_episodes + 1):
-        caches, actions, returns, raw_total, info = run_episode_collect(
-            env, policy, rng, cfg.gamma, cfg.use_shaping
+        states, actions, returns, raw_total, info = run_episode_collect(
+            env, policy, cfg.gamma, cfg.use_shaping
         )
 
         baseline = cfg.baseline_momentum * baseline + (1 - cfg.baseline_momentum) * returns[0]
         advantages = returns - baseline
-        # normalize for stability across variable-length episodes
         adv_std = advantages.std() + 1e-6
         advantages = advantages / adv_std
 
-        grads = zero_grads(policy.params)
-        for cache, action, adv in zip(caches, actions, advantages):
-            pg = policy.logprob_grad(cache, action, coeff=adv)
-            add_grads(grads, pg)
+        states_t = torch.as_tensor(np.stack(states), dtype=torch.float64)
+        actions_t = torch.as_tensor(actions, dtype=torch.float64)
+        advantages_t = torch.as_tensor(advantages, dtype=torch.float64)
 
-            # entropy bonus gradient: H(p) = -p log p - (1-p) log(1-p)
-            # dH/dlogit = -p(1-p) * (log p - log(1-p)) ... we approximate
-            # with the simple, numerically stable surrogate dH/dlogit ~ (0.5 - p)*p*(1-p)*4
-            # (pushes logits toward 0 / p=0.5, standard entropy-bonus effect)
-            p = cache["prob"]
-            d_ent_logit = (0.5 - p) * 4.0 * cfg.entropy_coef
-            # build entropy grad manually via chain rule reusing cached activations
-            h, s = cache["h"], cache["s"]
-            d_W2 = d_ent_logit * h
-            d_b2 = np.array([d_ent_logit])
-            d_h = d_ent_logit * policy.params["W2"]
-            d_z1 = d_h * (1 - h ** 2)
-            d_W1 = np.outer(d_z1, s)
-            d_b1 = d_z1
-            add_grads(grads, {"W1": d_W1, "b1": d_b1, "W2": d_W2, "b2": d_b2})
+        dist = policy.dist(states_t)
+        log_probs = dist.log_prob(actions_t)
+        entropy = dist.entropy()
 
-        # we ASCEND the objective (maximize expected return + entropy), Adam
-        # here is written as a descent step, so we pass in the *negative*
-        # gradient of the loss = -(objective) -> negative of grads above.
-        neg_grads = {k: -v for k, v in grads.items()}
-        for k in neg_grads:
-            norm = np.linalg.norm(neg_grads[k])
-            if norm > cfg.grad_clip:
-                neg_grads[k] *= cfg.grad_clip / (norm + 1e-8)
-        opt.step(policy.params, neg_grads)
+        # ascend E[log pi * A] + entropy_coef * H  =>  minimize the negative
+        loss = -(log_probs * advantages_t).sum() - cfg.entropy_coef * entropy.sum()
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=cfg.grad_clip)
+        opt.step()
 
         log.episode.append(ep)
         log.train_reward.append(raw_total)
 
         if ep % cfg.eval_every == 0 or ep == cfg.num_episodes:
-            avg_r, avg_succ, avg_cost = evaluate(env, policy, cfg.eval_episodes, rng)
+            avg_r, avg_succ, avg_cost = evaluate(env, policy, cfg.eval_episodes)
             log.eval_episode.append(ep)
             log.eval_reward.append(avg_r)
             log.eval_success.append(avg_succ)

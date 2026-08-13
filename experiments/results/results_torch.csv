@@ -1,7 +1,0 @@
-method,mean_reward,std_reward,mean_success,mean_cost_frac
-REINFORCE-torch (no shaping),0.6235,0.0024,0.9736,0.9428
-REINFORCE-torch (+ shaping),0.4412,0.1764,0.6965,0.6880
-PPO-lite-torch (+ shaping),0.5530,0.0980,0.8620,0.8333
-Random (p=0.5),0.6346,0.0019,0.9710,0.9071
-Greedy-relevance,0.6453,0.0004,1.0000,0.9270
-"Oracle (upper bound, uses labels)",0.8750,0.0018,0.9996,0.3562

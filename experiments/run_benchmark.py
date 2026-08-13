@@ -54,8 +54,8 @@ def main():
     t0 = time.time()
     env_cfg = EnvConfig(seed=0)
 
-    all_learning_curves = {}   # name -> list of (eval_episode, eval_reward) per seed
-    final_scores = {}          # name -> list of (reward, success, cost) per seed
+    all_learning_curves = {}
+    final_scores = {}
 
     for seed in range(N_SEEDS):
         print(f"\n=== Seed {seed} ===")
@@ -88,14 +88,13 @@ def main():
 
         # ---- Final held-out evaluation, same eval env/seed for all methods ----
         eval_env = ContextSelectionEnv(EnvConfig(**{**env_cfg.__dict__, "seed": 5000 + seed}))
-        rng = np.random.default_rng(9999 + seed)
 
         for name, pol in [
             ("REINFORCE (no shaping)", policy_ns),
             ("REINFORCE (+ shaping)", policy_s),
             ("PPO-lite (+ shaping)", policy_ppo),
         ]:
-            avg_r, avg_succ, avg_cost = evaluate(eval_env, pol, N_EVAL_EPISODES, rng)
+            avg_r, avg_succ, avg_cost = evaluate(eval_env, pol, N_EVAL_EPISODES)
             final_scores.setdefault(name, []).append((avg_r, avg_succ, avg_cost))
 
         eval_env2 = ContextSelectionEnv(EnvConfig(**{**env_cfg.__dict__, "seed": 5000 + seed}))
@@ -110,8 +109,6 @@ def main():
         r, s, c, _ = run_baseline(OraclePolicy(), eval_env4, N_EVAL_EPISODES, 5000 + seed)
         final_scores.setdefault("Oracle (upper bound, uses labels)", []).append((r, s, c))
 
-    # ---------------------------------------------------------------
-    # Save results.csv
     # ---------------------------------------------------------------
     csv_path = os.path.join(RESULTS_DIR, "results.csv")
     with open(csv_path, "w", newline="") as f:
@@ -129,7 +126,7 @@ def main():
     print(f"\nSaved {csv_path}")
 
     # ---------------------------------------------------------------
-    # Plot 1: learning curves (mean +/- std across seeds)
+    # Plot 1: learning curves
     # ---------------------------------------------------------------
     plt.figure(figsize=(8, 5))
     colors = {"REINFORCE (no shaping)": "#d62728",
@@ -137,7 +134,7 @@ def main():
               "PPO-lite (+ shaping)": "#2ca02c"}
     for name, runs in all_learning_curves.items():
         eps = runs[0][0]
-        curves = np.array([r[1] for r in runs])  # seeds x evals
+        curves = np.array([r[1] for r in runs])
         mean = curves.mean(axis=0)
         std = curves.std(axis=0)
         plt.plot(eps, mean, label=name, color=colors.get(name))
