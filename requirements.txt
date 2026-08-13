@@ -1,0 +1,13 @@
+# Core experiments (environment, policy, REINFORCE, PPO-lite, tests, plots)
+# run on these alone -- no GPU / deep-learning framework required.
+numpy>=1.24
+matplotlib>=3.7
+
+# Optional: only needed for torch_reference/policy_torch.py (a PyTorch
+# reimplementation of the policy for GPU / production-scale use).
+# torch>=2.0
+
+# Optional: tests also run fine under pytest if you have it installed
+# (they're plain unittest.TestCase, so `python -m unittest discover -s tests`
+# works with zero extra dependencies).
+# pytest>=7.0
